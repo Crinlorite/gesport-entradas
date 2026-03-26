@@ -1,0 +1,14 @@
+# PyInstaller
+build/
+dist/
+*.spec.bak
+
+# Datos locales generados en ejecución
+ventas/
+entradas_config.json
+*.wtest
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
