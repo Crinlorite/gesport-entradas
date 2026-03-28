@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import subprocess
+import time
 from datetime import datetime
 
 from precios import INSTALACIONES, CATEGORIAS, NOMBRE_TICKET
@@ -44,7 +45,7 @@ def load_config():
         with open(get_config_path(), "r", encoding="utf-8") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"trabajador": "", "impresora": ""}
+        return {"impresora": ""}
 
 
 def save_config(data):
@@ -144,7 +145,6 @@ class VentaEntradas:
         self.total_var      = tk.StringVar(value="0.00 €")
         self.importe_var    = tk.StringVar()
         self.cambio_var     = tk.StringVar()
-        self.trabajador_var = tk.StringVar(value=self.config.get("trabajador", ""))
         self.cantidad_vars   = {}
         self.precio_labels   = {}
         self.subtotal_labels = {}
@@ -264,13 +264,6 @@ class VentaEntradas:
                                     bg="#f5f5f5", fg="#2c3e50")
         self.cambio_lbl.pack(side="left", padx=(18, 0))
 
-        # --- Trabajador ---
-        trab_f = ttk.Frame(f)
-        trab_f.pack(fill="x", pady=(4, 8))
-        ttk.Label(trab_f, text="Trabajador:", style="Bold.TLabel").pack(side="left")
-        ttk.Entry(trab_f, textvariable=self.trabajador_var, width=24,
-                  font=("Segoe UI", 10)).pack(side="left", padx=8)
-
         ttk.Frame(f, style="Sep.TFrame", height=1).pack(fill="x", pady=(0, 8))
 
         # --- Botones ---
@@ -366,8 +359,6 @@ class VentaEntradas:
         now = datetime.now()
         nombre = self.instalacion_actual
         tipo = "LABORABLE" if self.tipo_dia.get() == "laborable" else "FESTIVO/FIN SEMANA"
-        trabajador = self.trabajador_var.get().strip()
-
         nombre_corto = NOMBRE_TICKET.get(nombre, nombre)
         lines = [
             "====================",
@@ -376,10 +367,9 @@ class VentaEntradas:
             f"Fecha: {now.strftime('%d/%m/%Y')}",
             f"Hora:  {now.strftime('%H:%M:%S')}",
             f"Inst:  {nombre_corto}",
+            f"Dia:   {tipo}",
+            "--------------------",
         ]
-        if trabajador:
-            lines.append(f"Trab:  {trabajador}")
-        lines += [f"Dia:   {tipo}", "--------------------"]
 
         total = 0.0
         for key, label in CATEGORIAS:
@@ -422,7 +412,7 @@ class VentaEntradas:
             fh.write(texto)
             fh.flush()
             os.fsync(fh.fileno())   # garantiza escritura en disco antes de imprimir
-        return filepath
+        return filepath, now
 
     def _hay_entradas(self):
         return any(self._cantidad(k) > 0 for k, _ in CATEGORIAS)
@@ -431,9 +421,6 @@ class VentaEntradas:
         for key, _ in CATEGORIAS:
             self.cantidad_vars[key].set("0")
         self.importe_var.set("")
-        # Guardar trabajador en config
-        self.config["trabajador"] = self.trabajador_var.get().strip()
-        save_config(self.config)
 
     # ── Registrar venta ───────────────────────────────────────────────────────
 
@@ -465,15 +452,19 @@ class VentaEntradas:
         btn_f.pack(padx=24, pady=(0, 6))
 
         def confirmar(modo):
-            # Aquí sí guardamos y reseteamos
-            filepath = self._guardar_venta()
+            # Capturar datos ANTES de resetear
+            items = [
+                (label.split("(")[0].strip(), self._cantidad(key), self._precio(key))
+                for key, label in CATEGORIAS
+                if self._cantidad(key) > 0
+            ]
+            filepath, now = self._guardar_venta()
             self._resetear()
             dlg.destroy()
             if printer:
                 try:
                     if modo == "individual":
-                        indiv_path = self._build_tickets_individuales(filepath)
-                        self._print_to_printer(indiv_path, printer)
+                        self._print_individual_tickets(items, now, printer)
                     else:
                         self._print_to_printer(filepath, printer)
                 except Exception as e:
@@ -508,8 +499,8 @@ class VentaEntradas:
             dlg.destroy()
             try:
                 if modo == "individual":
-                    path = self._build_tickets_individuales(filepath)
-                    self._print_to_printer(path, printer)
+                    for ticket in self._build_tickets_individuales(filepath):
+                        self._print_ticket(ticket, printer, suffix=self._NOMBRE_SUFFIX)
                 else:
                     self._print_to_printer(filepath, printer)
             except Exception as e:
@@ -524,82 +515,124 @@ class VentaEntradas:
                    command=dlg.destroy).pack(pady=(6, 14))
 
     def _build_tickets_individuales(self, filepath_conjunto):
-        """Genera un archivo con un ticket por persona a partir del ticket conjunto guardado."""
-        # Releer el ticket para extraer los datos
+        """Parsea el ticket conjunto guardado y devuelve lista de strings (uno por persona)."""
         with open(filepath_conjunto, "r", encoding="utf-8") as fh:
             lines = fh.readlines()
 
-        # Extraer cabecera común
-        fecha = hora = inst = trab = dia = ""
+        fecha = hora = inst = dia = ""
         for l in lines:
             s = l.strip()
             if s.startswith("Fecha:"): fecha = s.split(":", 1)[1].strip()
             elif s.startswith("Hora:"): hora  = s.split(":", 1)[1].strip()
             elif s.startswith("Inst:"): inst  = s.split(":", 1)[1].strip()
-            elif s.startswith("Trab:"): trab  = s.split(":", 1)[1].strip()
             elif s.startswith("Dia:"):  dia   = s.split(":", 1)[1].strip()
 
-        # Extraer líneas de categoría: " Categoria    xN   XX.XX€"
         import re
-        pat = re.compile(r"^\s+(.+?)\s+x(\d+)\s+([\d.]+)€\s*$")
-        entradas = []  # [(categoria, precio_unitario)]
+        pat = re.compile(r"^\s+(.+?)\s+x(\d+)\s+([\d.]+)\s*€\s*$")
+        sep = "====================\n"
+        mid = "--------------------\n"
+        bloques = []
         for l in lines:
             m = pat.match(l)
             if m:
                 cat   = m.group(1).strip()
                 cant  = int(m.group(2))
-                total_linea = float(m.group(3))
-                precio_unit = total_linea / cant if cant else 0.0
+                precio = round(float(m.group(3)) / cant, 2) if cant else 0.0
                 for _ in range(cant):
-                    entradas.append((cat, precio_unit))
+                    t  = sep + "  VENTA DE ENTRADA\n" + sep
+                    t += f"Fecha: {fecha}\n"
+                    t += f"Hora:  {hora}\n"
+                    t += f"Inst:  {inst}\n"
+                    t += f"Dia:   {dia}\n"
+                    t += mid
+                    t += f" {cat}\n"
+                    t += f"       {precio:.2f} €\n"
+                    t += sep
+                    bloques.append(t)
+        return bloques
 
-        # Construir tickets individuales
+    def _print_individual_tickets(self, items, now, printer):
+        """Un trabajo de impresión RAW por persona — activa el corte automático entre tickets."""
+        nombre_corto = NOMBRE_TICKET.get(self.instalacion_actual, self.instalacion_actual)
+        tipo = "LABORABLE" if self.tipo_dia.get() == "laborable" else "FESTIVO/FIN SEMANA"
         sep = "====================\n"
         mid = "--------------------\n"
-        bloques = []
-        for cat, precio in entradas:
-            t  = sep
-            t += "  VENTA DE ENTRADA\n"
-            t += sep
-            t += f"Fecha: {fecha}\n"
-            t += f"Hora:  {hora}\n"
-            t += f"Inst:  {inst}\n"
-            if trab:
-                t += f"Trab:  {trab}\n"
-            t += f"Dia:   {dia}\n"
-            t += mid
-            t += f" {cat}\n"
-            t += f"       {precio:.2f} €\n"
-            t += sep
-            bloques.append(t)
+        for cat, cant, precio in items:
+            for _ in range(cant):
+                t  = sep + "  VENTA DE ENTRADA\n" + sep
+                t += f"Fecha: {now.strftime('%d/%m/%Y')}\n"
+                t += f"Hora:  {now.strftime('%H:%M:%S')}\n"
+                t += f"Inst:  {nombre_corto}\n"
+                t += f"Dia:   {tipo}\n"
+                t += mid
+                t += f" {cat}\n"
+                t += f"       {precio:.2f} €\n"
+                t += sep
+                self._print_ticket(t, printer, suffix=self._NOMBRE_SUFFIX)
 
-        contenido = "\n\n".join(bloques)
+    # ── ESC/POS — Epson TM-T20 ────────────────────────────────────────────────
 
-        indiv_path = filepath_conjunto.replace(".txt", "_individual.txt")
-        with open(indiv_path, "w", encoding="utf-8") as fh:
-            fh.write(contenido)
-            fh.flush()
-            os.fsync(fh.fileno())
-        return indiv_path
+    _ESC_INIT     = b'\x1b\x40'             # ESC @ — inicializar impresora
+    _ESC_CP858    = b'\x1b\x74\x13'        # ESC t 19 — CP858 (español + € incluido)
+    _ESC_CENTER   = b'\x1b\x61\x01'        # ESC a 1 — centrado
+    _ESC_BOLD_ON  = b'\x1b\x45\x01'        # ESC E 1 — negrita on
+    _ESC_BOLD_OFF = b'\x1b\x45\x00'        # ESC E 0 — negrita off
+    _CUT_FULL     = b'\n\n\n\n\n\n\n\n\x1d\x56\x00'  # avance + GS V 0 — corte completo
+
+    _NOMBRE_SUFFIX = (                     # bloque "escribe tu nombre" + zona para escribir
+        b'\n'
+        + b'\x1b\x45\x01'               # negrita on
+        + b'====================\n'
+        + 'ESCRIBE TU NOMBRE COMPLETO DEBAJO\n'.encode("cp858")
+        + b'====================\n'
+        + b'\x1b\x45\x00'               # negrita off
+        + b'==                ==\n'
+        + b'\n'
+        + b'\n'
+        + b'\n'
+        + b'==                ==\n'
+    )
+
+    def _raw_print(self, data: bytes, printer: str):
+        """Envía bytes RAW directamente a la impresora (sin GDI ni márgenes)."""
+        import win32print
+        h = win32print.OpenPrinter(printer)
+        try:
+            win32print.StartDocPrinter(h, 1, ("Ticket", None, "RAW"))
+            try:
+                win32print.StartPagePrinter(h)
+                win32print.WritePrinter(h, data)
+                win32print.EndPagePrinter(h)
+            finally:
+                win32print.EndDocPrinter(h)
+        finally:
+            win32print.ClosePrinter(h)
+
+    def _print_ticket(self, text: str, printer: str, suffix: bytes = b''):
+        """Envía un ticket con cabecera ESC/POS y comando de corte al final."""
+        payload = (
+            self._ESC_INIT
+            + self._ESC_CP858
+            + self._ESC_CENTER
+            + text.encode("cp858", errors="replace")
+            + suffix
+            + self._CUT_FULL
+        )
+        self._raw_print(payload, printer)
 
     def _print_to_printer(self, filepath, printer):
-        """Imprime en la impresora indicada SIN cambiar la predeterminada del sistema."""
-        try:
-            import winreg
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                                 r"Software\Microsoft\Notepad", 0, winreg.KEY_SET_VALUE)
-            for margin in ("iMarginLeft", "iMarginRight", "iMarginTop", "iMarginBottom"):
-                winreg.SetValueEx(key, margin, 0, winreg.REG_DWORD, 0)
-            winreg.SetValueEx(key, "szHeader",  0, winreg.REG_SZ, "")
-            winreg.SetValueEx(key, "szTrailer", 0, winreg.REG_SZ, "")
-            winreg.CloseKey(key)
-        except Exception:
-            pass
-        # /PT = imprime en impresora específica — NO cambia la del sistema
-        subprocess.Popen(
-            ["notepad.exe", "/PT", filepath, printer],
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
+        """Imprime el archivo de ticket conjunto como un único trabajo RAW."""
+        for _ in range(20):
+            if os.path.isfile(filepath) and os.path.getsize(filepath) > 0:
+                break
+            time.sleep(0.1)
+        else:
+            messagebox.showerror("Error al imprimir",
+                                 f"No se encontró el archivo de ticket:\n{filepath}")
+            return
+        with open(filepath, "r", encoding="utf-8") as fh:
+            text = fh.read()
+        self._print_ticket(text, printer)
 
     # ── Configuración ─────────────────────────────────────────────────────────
 
@@ -677,7 +710,7 @@ class VentaEntradas:
             if not fname.startswith("venta_") or not fname.endswith(".txt"):
                 continue
             fpath = os.path.join(ventas_dir, fname)
-            fecha = hora = trabajador = instalacion = total = ""
+            fecha = hora = instalacion = total = ""
             try:
                 with open(fpath, "r", encoding="utf-8") as fh:
                     for line in fh:
@@ -688,16 +721,12 @@ class VentaEntradas:
                             hora = l.split(":", 1)[1].strip()
                         elif l.startswith("Inst:"):
                             instalacion = l.split(":", 1)[1].strip()
-                        elif l.startswith("Trab:"):
-                            trabajador = l.split(":", 1)[1].strip()
                         elif l.strip().startswith("TOTAL:"):
                             total = l.split("TOTAL:", 1)[1].strip()
             except Exception:
                 continue
 
             label = f"{fecha}  {hora}"
-            if trabajador:
-                label += f"  —  {trabajador}"
             if instalacion:
                 label += f"  —  {instalacion}"
             if total:
@@ -721,7 +750,7 @@ class VentaEntradas:
         filter_var = tk.StringVar()
         ttk.Entry(filter_f, textvariable=filter_var, width=40,
                   font=("Segoe UI", 10)).pack(side="left", padx=8)
-        ttk.Label(filter_f, text="(trabajador, fecha, hora, instalación…)",
+        ttk.Label(filter_f, text="(fecha, hora, instalación…)",
                   style="Muted.TLabel").pack(side="left")
 
         # --- Lista ---
